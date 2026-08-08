@@ -170,7 +170,9 @@ email----password----clientId----refreshToken
 
 #### 通用 API 邮箱
 
-每行格式：
+WebUI「邮箱池 → 导入」建议选择 `API 邮箱（自动识别）`。系统按 URL 结构自动分流到通用 API 或 FlySMS 内部适配器，不依赖固定域名。
+
+通用页面每行格式：
 
 ```text
 email----code_url
@@ -186,6 +188,31 @@ EMAIL_SOURCE = "generic_api"
 
 ```python
 EMAIL_SOURCE = "outlook,generic_api,mailnest"
+```
+
+#### FlySMS 邮箱
+
+FlySMS 使用独立邮箱池，不经过通用 API 的直接 GET 逻辑。自动识别支持以下格式：
+
+```text
+mailbox@example.com----https://flysms.xyz/icloud/pickup#email=mailbox%40example.com&key=TOKEN
+mailbox@example.com====https://flysms.top/icloud/pickup#email=mailbox%40example.com&key=TOKEN
+mailbox@example.com---TOKEN---https://flysms.top/icloud/pickup#email=mailbox%40example.com&key=TOKEN
+mailbox@example.com---TOKEN---https://flysms.top/icloud/api/pickup/messages/latest
+```
+
+直接 API 地址会被规范化为 pickup 地址。三段格式同时提供中间 Token 和 URL `key` 时，两者必须一致；URL 中的邮箱也必须与行首邮箱一致，否则整行拒绝导入。
+
+`通用 API 取码邮箱` 和 `FlySMS 取码邮箱` 仍保留为手动覆盖选项。注册时设置：
+
+```python
+EMAIL_SOURCE = "flysms"
+```
+
+需要保留通用 API 作为备用时可配置：
+
+```python
+EMAIL_SOURCE = "flysms,generic_api"
 ```
 
 #### GPTMail 临时邮箱

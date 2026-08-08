@@ -2307,6 +2307,7 @@
             <button type="button" class="outlook-v2-select-item is-active" data-value="all" role="option">全部邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="outlook" role="option">Outlook 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="generic_api" role="option">通用 API 邮箱池</button>
+            <button type="button" class="outlook-v2-select-item" data-value="flysms" role="option">FlySMS 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="cloudflare_domain" role="option">域名邮箱池</button>
           </div>
           <input type="hidden" id="poolSourceV2" value="all">
@@ -2399,7 +2400,7 @@
     <div class="outlook-import-head">
       <div class="outlook-import-head-main">
         <h3 id="outlookImportTitle">导入邮箱素材</h3>
-        <p>Outlook：邮箱----密码----clientId----refreshToken；通用 API：邮箱----取码地址（---- 或 ==== 均可）。默认按「已注册成功账号」导入，方便在账号页补跑 Codex。</p>
+        <p>Outlook：邮箱----密码----clientId----refreshToken；API 邮箱可自动识别通用页面与 FlySMS，支持 邮箱----地址、邮箱====地址、邮箱---Token---地址。</p>
       </div>
       <button type="button" class="outlook-import-close" id="btnCloseOutlookImport" aria-label="关闭">×</button>
     </div>
@@ -2411,11 +2412,13 @@
           <button type="button" class="outlook-v2-select-btn" id="importSourceV2Btn" aria-haspopup="listbox" aria-expanded="false">Outlook 邮箱池</button>
           <div class="outlook-v2-select-menu" role="listbox">
             <button type="button" class="outlook-v2-select-item is-active" data-value="outlook" role="option">Outlook 邮箱池</button>
+            <button type="button" class="outlook-v2-select-item" data-value="api_auto" role="option">API 邮箱（自动识别）</button>
             <button type="button" class="outlook-v2-select-item" data-value="generic_api" role="option">通用 API 取码邮箱</button>
+            <button type="button" class="outlook-v2-select-item" data-value="flysms" role="option">FlySMS 取码邮箱</button>
           </div>
           <input type="hidden" id="importSourceV2" value="outlook">
         </div>
-        <span class="outlook-import-hint">注册来源可在配置里填多个，例如：outlook,generic_api</span>
+        <span class="outlook-import-hint">建议使用自动识别；通用 API 和 FlySMS 选项用于手动覆盖识别结果。</span>
       </label>
       <label class="outlook-import-check">
         <input id="importAsRegisteredV2" type="checkbox" checked>
@@ -2423,7 +2426,7 @@
       </label>
       <label class="outlook-import-field">
         <span>邮箱素材</span>
-        <textarea id="importTextV2" placeholder="Outlook: email----password----clientId----refreshToken&#10;通用API: email----取码地址"></textarea>
+        <textarea id="importTextV2" placeholder="Outlook: email----password----clientId----refreshToken&#10;API: email----取码地址&#10;FlySMS 三段: email---token---pickup地址"></textarea>
       </label>
     </div>
     <div class="outlook-import-foot">
@@ -4587,6 +4590,7 @@ const POOL_SOURCE_LABELS = {
   all: '全部邮箱池',
   outlook: 'Outlook 邮箱池',
   generic_api: '通用 API 邮箱池',
+  flysms: 'FlySMS 邮箱池',
   cloudflare_domain: '域名邮箱池',
 };
 function setPoolSourceV2(val) {
@@ -4609,7 +4613,7 @@ function getOutlookQuery() {
 }
 function poolKey(r) { return `${r.source || getPoolSource() || 'outlook'}|${r.email || ''}`; }
 function poolLabel(src) {
-  return ({outlook:'Outlook', generic_api:'通用API', cloudflare_domain:'域名邮箱'})[src] || src || '-';
+  return ({outlook:'Outlook', generic_api:'通用API', flysms:'FlySMS', cloudflare_domain:'域名邮箱'})[src] || src || '-';
 }
 async function loadOutlook() {
   try {
@@ -4725,7 +4729,7 @@ function onPoolSourceChange(el) {
   PAGERS.outlook.page = 1;
   OUTLOOK_SELECTED.clear();
   const val = el ? el.value : getPoolSource();
-  if (val === 'outlook' || val === 'generic_api') setImportSourceV2(val);
+  if (val === 'outlook' || val === 'generic_api' || val === 'flysms') setImportSourceV2(val);
   loadOutlook();
 }
 function syncOutlookSelectAll(checked) {
@@ -4835,7 +4839,9 @@ async function onOutlookBodyClick(e) {
 
 const IMPORT_SOURCE_LABELS = {
   outlook: 'Outlook 邮箱池',
+  api_auto: 'API 邮箱（自动识别）',
   generic_api: '通用 API 取码邮箱',
+  flysms: 'FlySMS 取码邮箱',
 };
 function setImportSourceV2(val) {
   const hidden = document.getElementById('importSourceV2');
@@ -4857,7 +4863,7 @@ function openOutlookImportModal() {
   const result = $('#importResultV2');
   if (result) result.innerHTML = '';
   const pool = getPoolSource();
-  if (pool === 'outlook' || pool === 'generic_api') setImportSourceV2(pool);
+  if (pool === 'outlook' || pool === 'generic_api' || pool === 'flysms') setImportSourceV2(pool);
   else setImportSourceV2('outlook');
   modal.classList.remove('hidden');
   updateModalScrollLock();
@@ -4929,7 +4935,8 @@ async function doImportOutlook() {
     const msg = `按 ${mode} 导入：解析 ${r.parsed} 行，新增 ${r.inserted}，跳过 ${r.skipped}${r.as_registered ? '；可到“账号”页选择后批量补跑 Codex' : ''}`;
     if (resultEl) resultEl.innerHTML = `<div class="banner info">${esc(msg)}</div>`;
     if (textEl) textEl.value = '';
-    setPoolSourceV2(source);
+    const importedSources = Object.keys(r.imported_by_source || {});
+    setPoolSourceV2(importedSources.length === 1 ? importedSources[0] : 'all');
     setImportSourceV2(source);
     loadOutlook(); loadAccounts(); loadSummary();
     showToast(`导入完成：新增 ${r.inserted}，跳过 ${r.skipped}`);

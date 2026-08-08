@@ -30,7 +30,7 @@ def _pool_source_arg(default: str = "outlook") -> str:
     if not src and request.method == "POST":
         data = request.get_json(silent=True) or {}
         src = (data.get("source") or data.get("type") or "").strip()
-    return src if src in ("all", "outlook", "generic_api", "cloudflare_domain") else default
+    return src if src in ("all", "outlook", "generic_api", "flysms", "cloudflare_domain") else default
 
 
 def _with_pool_source(rows: list[dict], source: str) -> list[dict]:
@@ -257,6 +257,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 continue
             one = (
                 db.generic_api_email_pool_summary() if src == "generic_api"
+                else db.flysms_email_pool_summary() if src == "flysms"
                 else db.domain_email_pool_summary() if src == "cloudflare_domain"
                 else db.outlook_pool_summary()
             )
@@ -1293,10 +1294,13 @@ def create_app(auth_code: str | None = None) -> Flask:
             rows = []
             rows += _with_pool_source(db.list_outlook_pool(status=status, limit=fetch_limit), "outlook")
             rows += _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
+            rows += _with_pool_source(db.list_flysms_email_pool(status=status, limit=fetch_limit), "flysms")
             rows += _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
             rows = sorted(rows, key=lambda x: str(x.get("created_at") or x.get("imported_at") or x.get("used_at") or ""), reverse=True)
         elif source == "generic_api":
             rows = _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
+        elif source == "flysms":
+            rows = _with_pool_source(db.list_flysms_email_pool(status=status, limit=fetch_limit), "flysms")
         elif source == "cloudflare_domain":
             rows = _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
         else:
@@ -1314,35 +1318,38 @@ def create_app(auth_code: str | None = None) -> Flask:
         """
         粘贴文本导入邮箱素材。
         Outlook：email----password----clientId----refreshToken
+        API 自动识别：email----url / email---token---url
         通用 API：email----code_url
-        分隔符兼容 ---- 与 ====。
+        FlySMS：email----pickup_url
+        分隔符兼容 ----、==== 与 FlySMS 三段 ---。
         """
         data = request.get_json(silent=True) or {}
         source = (data.get("source") or data.get("type") or "").strip()
-        if source not in ("outlook", "generic_api"):
-            return jsonify({"ok": False, "error": "导入时请选择具体类型：Outlook 或 通用 API"}), 400
+        if source not in ("outlook", "api_auto", "generic_api", "flysms"):
+            return jsonify({"ok": False, "error": "导入时请选择：Outlook、API 邮箱自动识别、通用 API 或 FlySMS"}), 400
         text = data.get("text") or ""
         as_registered = bool(data.get("as_registered", False))
         records = []
-        for line in text.splitlines():
+        parse_errors = []
+        for line_no, line in enumerate(text.splitlines(), start=1):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
+            if source in ("api_auto", "generic_api", "flysms"):
+                from core.api_mail_import import ApiMailImportError, parse_api_mail_line
+
+                try:
+                    records.append(parse_api_mail_line(line, source=source))
+                except ApiMailImportError as exc:
+                    parse_errors.append(f"第 {line_no} 行: {exc}")
+                continue
             parts = line.split("----") if "----" in line else line.split("====")
             parts = [p.strip() for p in parts]
-            if source == "generic_api":
-                if len(parts) < 2:
-                    continue
-                records.append({
-                    "email": parts[0],
-                    "code_url": parts[1],
-                    "access_token": parts[2] if len(parts) > 2 else "",
-                    "totp_secret": parts[3] if len(parts) > 3 else "",
-                })
-                continue
             if len(parts) < 4:
+                parse_errors.append(f"第 {line_no} 行: Outlook 需要 4 段")
                 continue
             records.append({
+                "source": "outlook",
                 "email": parts[0],
                 "password": parts[1],
                 "client_id": parts[2],
@@ -1350,21 +1357,39 @@ def create_app(auth_code: str | None = None) -> Flask:
                 "access_token": parts[4] if len(parts) > 4 else "",
                 "totp_secret": parts[5] if len(parts) > 5 else "",
             })
+        if parse_errors:
+            return jsonify({"ok": False, "error": "；".join(parse_errors[:10]), "errors": parse_errors}), 400
         if not records:
-            need = "2 段：邮箱----取码地址" if source == "generic_api" else "4 段：email----password----clientId----refreshToken"
+            need = "邮箱----取码地址 或 邮箱---Token---取码地址" if source in ("api_auto", "generic_api", "flysms") else "4 段：email----password----clientId----refreshToken"
             return jsonify({"ok": False, "error": f"未解析到有效邮箱行（需 {need}，---- 或 ==== 分隔）"}), 400
-        if as_registered:
-            inserted, skipped = db.import_registered_email_accounts(records, source=source)
-        elif source == "generic_api":
-            inserted, skipped = db.import_generic_api_emails(records)
-        else:
-            inserted, skipped = db.import_outlook_accounts(records)
+        inserted = skipped = 0
+        by_source = {}
+        for record in records:
+            by_source.setdefault(record.get("source") or source, []).append(record)
+        imported_by_source = {}
+        for concrete_source, source_records in by_source.items():
+            if as_registered:
+                one_inserted, one_skipped = db.import_registered_email_accounts(source_records, source=concrete_source)
+            elif concrete_source == "generic_api":
+                one_inserted, one_skipped = db.import_generic_api_emails(source_records)
+            elif concrete_source == "flysms":
+                one_inserted, one_skipped = db.import_flysms_emails(source_records)
+            else:
+                one_inserted, one_skipped = db.import_outlook_accounts(source_records)
+            inserted += one_inserted
+            skipped += one_skipped
+            imported_by_source[concrete_source] = {
+                "parsed": len(source_records),
+                "inserted": one_inserted,
+                "skipped": one_skipped,
+            }
         return jsonify({
             "ok": True,
             "inserted": inserted,
             "skipped": skipped,
             "parsed": len(records),
             "as_registered": as_registered,
+            "imported_by_source": imported_by_source,
         })
 
     @app.post("/api/outlook/status")
@@ -1380,6 +1405,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             source = "outlook"
         if source == "generic_api":
             db.release_generic_api_email(email, status=status, note=data.get("note"))
+        elif source == "flysms":
+            db.release_flysms_email(email, status=status, note=data.get("note"))
         elif source == "cloudflare_domain":
             db.release_domain_email(email, status=status, note=data.get("note"))
         else:
@@ -1423,6 +1450,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             try:
                 if item_source == "generic_api":
                     db.release_generic_api_email(email, status=status, note=note)
+                elif item_source == "flysms":
+                    db.release_flysms_email(email, status=status, note=note)
                 elif item_source == "cloudflare_domain":
                     db.release_domain_email(email, status=status, note=note)
                 else:
@@ -1450,6 +1479,8 @@ def create_app(auth_code: str | None = None) -> Flask:
         deleted = (
             db.delete_generic_api_email(email)
             if source == "generic_api"
+            else db.delete_flysms_email(email)
+            if source == "flysms"
             else db.delete_domain_email(email)
             if source == "cloudflare_domain"
             else db.delete_outlook(email)
@@ -1489,6 +1520,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             deleted_ok = (
                 db.delete_generic_api_email(email)
                 if item_source == "generic_api"
+                else db.delete_flysms_email(email)
+                if item_source == "flysms"
                 else db.delete_domain_email(email)
                 if item_source == "cloudflare_domain"
                 else db.delete_outlook(email)
@@ -2219,12 +2252,19 @@ def create_app(auth_code: str | None = None) -> Flask:
             warning = ""
             if pool.get("available", 0) < count:
                 warning = f"通用 API 邮箱池仅 {pool.get('available', 0)} 个可用，少于任务数 {count}，不足的会失败"
+        elif sources == ["flysms"]:
+            pool = db.flysms_email_pool_summary()
+            warning = ""
+            if pool.get("available", 0) < count:
+                warning = f"FlySMS 邮箱池仅 {pool.get('available', 0)} 个可用，少于任务数 {count}，不足的会失败"
         elif len(sources) > 1:
             available = 0
             if "outlook" in sources:
                 available += db.outlook_pool_summary().get("available", 0)
             if "generic_api" in sources:
                 available += db.generic_api_email_pool_summary().get("available", 0)
+            if "flysms" in sources:
+                available += db.flysms_email_pool_summary().get("available", 0)
             warning = ""
             if available < count:
                 warning = f"多个邮箱池合计仅 {available} 个可用，少于任务数 {count}，不足的会失败"

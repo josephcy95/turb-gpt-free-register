@@ -30,6 +30,8 @@ _OUTLOOK_JSON = _PROJECT_ROOT / "用于注册的邮箱.json"
 _OUTLOOK_TXT = _PROJECT_ROOT / "用于注册的邮箱.txt"
 _GENERIC_API_EMAIL_JSON = _PROJECT_ROOT / "用于注册的API邮箱.json"
 _GENERIC_API_EMAIL_TXT = _PROJECT_ROOT / "用于注册的API邮箱.txt"
+_FLYSMS_EMAIL_JSON = _PROJECT_ROOT / "用于注册的FlySMS邮箱.json"
+_FLYSMS_EMAIL_TXT = _PROJECT_ROOT / "用于注册的FlySMS邮箱.txt"
 _ACCOUNTS_JSON = _PROJECT_ROOT / "注册成功的邮箱.json"
 _ACCOUNTS_TXT = _PROJECT_ROOT / "注册成功的邮箱.txt"
 _TOKENS_TXT = _PROJECT_ROOT / "注册成功的token.txt"
@@ -97,6 +99,13 @@ def _generic_api_email_line(row: dict) -> str:
     ])
 
 
+def _flysms_email_line(row: dict) -> str:
+    return "----".join([
+        row.get("email") or "",
+        row.get("pickup_url") or "",
+    ])
+
+
 def _account_line(row: dict) -> str:
     base = row.get("original_email_line") or row.get("email") or ""
     token = row.get("access_token") or ""
@@ -119,6 +128,12 @@ def _sync_generic_api_email_txt(rows: list[dict]) -> None:
     available_rows = [r for r in rows if r.get("status") == "available"]
     lines = [_generic_api_email_line(r) for r in sorted(available_rows, key=lambda x: int(x.get("id") or 0))]
     _GENERIC_API_EMAIL_TXT.write_text(("\n".join(lines) + ("\n" if lines else "")), encoding="utf-8")
+
+
+def _sync_flysms_email_txt(rows: list[dict]) -> None:
+    available_rows = [r for r in rows if r.get("status") == "available"]
+    lines = [_flysms_email_line(r) for r in sorted(available_rows, key=lambda x: int(x.get("id") or 0))]
+    _FLYSMS_EMAIL_TXT.write_text(("\n".join(lines) + ("\n" if lines else "")), encoding="utf-8")
 
 
 def _sync_accounts_txt(rows: list[dict]) -> None:
@@ -483,6 +498,18 @@ def _save_generic_api_emails(rows: list[dict]) -> None:
     _sync_generic_api_email_txt(rows)
 
 
+def _load_flysms_emails() -> list[dict]:
+    rows = _read_json(_FLYSMS_EMAIL_JSON, [])
+    return rows if isinstance(rows, list) else []
+
+
+def _save_flysms_emails(rows: list[dict]) -> None:
+    for row in rows:
+        row["copy_line"] = _flysms_email_line(row)
+    _write_json(_FLYSMS_EMAIL_JSON, rows)
+    _sync_flysms_email_txt(rows)
+
+
 def _load_accounts() -> list[dict]:
     rows = _read_json(_ACCOUNTS_JSON, None)
     if not isinstance(rows, list):
@@ -593,6 +620,19 @@ def _decorate_generic_api_email(row: dict, account_by_email: dict[str, dict] | N
     return out
 
 
+def _decorate_flysms_email(row: dict, account_by_email: dict[str, dict] | None = None) -> dict:
+    out = dict(row)
+    out["copy_line"] = _flysms_email_line(out)
+    account = account_by_email.get((out.get("email") or "").lower()) if account_by_email is not None else None
+    if account:
+        out["registered_account_id"] = account.get("id")
+        out["access_token"] = account.get("access_token")
+        out["access_token_preview"] = ((account.get("access_token") or "")[:40] + "...") if account.get("access_token") else ""
+        out["account_copy_line"] = _account_line(account)
+        out["totp_secret"] = account.get("totp_secret")
+    return out
+
+
 def _get_conn() -> None:
     """兼容旧入口：初始化文件存储目录。"""
     _ensure_storage()
@@ -627,8 +667,12 @@ def insert_account(
     with _LOCK:
         accounts = _load_accounts()
         outlook_rows = _load_outlook()
+        generic_rows = _load_generic_api_emails()
+        flysms_rows = _load_flysms_emails()
         existing = _find_by_email(accounts, email)
         outlook_row = _find_by_email(outlook_rows, email)
+        generic_row = _find_by_email(generic_rows, email)
+        flysms_row = _find_by_email(flysms_rows, email)
         extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
 
         if existing is None:
@@ -671,10 +715,30 @@ def insert_account(
             outlook_row["completed_at"] = _now()
             if totp_secret:
                 outlook_row["totp_secret"] = totp_secret
+        elif flysms_row:
+            row["original_email_line"] = _flysms_email_line(flysms_row)
+            flysms_row["status"] = "used"
+            flysms_row["used_at"] = flysms_row.get("used_at") or _now()
+            flysms_row["registered_account_id"] = row_id
+            flysms_row["access_token"] = access_token
+            flysms_row["completed_at"] = _now()
+            if totp_secret:
+                flysms_row["totp_secret"] = totp_secret
+        elif generic_row:
+            row["original_email_line"] = _generic_api_email_line(generic_row)
+            generic_row["status"] = "used"
+            generic_row["used_at"] = generic_row.get("used_at") or _now()
+            generic_row["registered_account_id"] = row_id
+            generic_row["access_token"] = access_token
+            generic_row["completed_at"] = _now()
+            if totp_secret:
+                generic_row["totp_secret"] = totp_secret
 
         row["copy_line"] = _account_line(row)
         _save_accounts(accounts)
         _save_outlook(outlook_rows)
+        _save_generic_api_emails(generic_rows)
+        _save_flysms_emails(flysms_rows)
         return row_id
 
 
@@ -1534,17 +1598,19 @@ def import_registered_email_accounts(records: list[dict], source: str | None) ->
     source:
       - outlook: records 元素 {email,password,client_id,refresh_token[,access_token,totp_secret]}
       - generic_api: records 元素 {email,code_url[,access_token,totp_secret]}
+      - flysms: records 元素 {email,pickup_url[,access_token,totp_secret]}
 
     返回 (新增账号数, 跳过数)。已存在账号会跳过；邮箱池中已存在的素材会复用并标记 used。
     """
     source = (source or "").strip().lower()
-    if source not in ("outlook", "generic_api"):
-        raise ValueError("source 必须显式传入 outlook / generic_api")
+    if source not in ("outlook", "generic_api", "flysms"):
+        raise ValueError("source 必须显式传入 outlook / generic_api / flysms")
 
     with _LOCK:
         accounts = _load_accounts()
         outlook_rows = _load_outlook()
         generic_rows = _load_generic_api_emails()
+        flysms_rows = _load_flysms_emails()
         inserted = skipped = 0
 
         for raw in records:
@@ -1560,31 +1626,37 @@ def import_registered_email_accounts(records: list[dict], source: str | None) ->
             original_line = email
             pool_row = None
 
-            if source == "generic_api":
+            if source in ("generic_api", "flysms"):
                 code_url = (raw.get("code_url") or raw.get("url") or "").strip()
                 if not code_url:
                     skipped += 1
                     continue
-                pool_row = _find_by_email(generic_rows, email)
+                pool_rows = flysms_rows if source == "flysms" else generic_rows
+                pool_row = _find_by_email(pool_rows, email)
                 if pool_row is None:
                     pool_row = {
-                        "id": _next_id(generic_rows),
+                        "id": _next_id(pool_rows),
                         "email": email,
-                        "code_url": code_url,
                         "status": "used",
                         "used_at": now,
                         "note": "导入为已注册账号，用于 Codex 授权",
                         "imported_at": now,
                     }
-                    generic_rows.append(pool_row)
+                    if source == "flysms":
+                        pool_row["pickup_url"] = code_url
+                    else:
+                        pool_row["code_url"] = code_url
+                    pool_rows.append(pool_row)
                 else:
-                    pool_row["code_url"] = code_url or pool_row.get("code_url")
+                    field = "pickup_url" if source == "flysms" else "code_url"
+                    pool_row[field] = code_url or pool_row.get(field)
                 pool_row["status"] = "used"
                 pool_row["used_at"] = pool_row.get("used_at") or now
                 pool_row["completed_at"] = pool_row.get("completed_at") or now
                 pool_row["note"] = pool_row.get("note") or "导入为已注册账号，用于 Codex 授权"
-                pool_row["copy_line"] = _generic_api_email_line(pool_row)
-                original_line = _generic_api_email_line(pool_row)
+                line_fn = _flysms_email_line if source == "flysms" else _generic_api_email_line
+                pool_row["copy_line"] = line_fn(pool_row)
+                original_line = line_fn(pool_row)
             else:
                 password = (raw.get("password") or "").strip()
                 client_id = (raw.get("client_id") or raw.get("clientId") or "").strip()
@@ -1654,6 +1726,7 @@ def import_registered_email_accounts(records: list[dict], source: str | None) ->
 
         _save_outlook(outlook_rows)
         _save_generic_api_emails(generic_rows)
+        _save_flysms_emails(flysms_rows)
         _save_accounts(accounts)
         return inserted, skipped
 
@@ -1872,6 +1945,192 @@ def get_generic_api_email_by_email(email: str) -> dict | None:
     with _LOCK:
         row = _find_by_email(_load_generic_api_emails(), email)
         return _decorate_generic_api_email(row) if row else None
+
+
+# ============================================================
+# flysms email pool
+# ============================================================
+
+def import_flysms_emails(records: list[dict]) -> tuple[int, int]:
+    """批量导入 FlySMS pickup 邮箱。records: {email, pickup_url}."""
+    with _LOCK:
+        rows = _load_flysms_emails()
+        inserted = skipped = 0
+        for raw in records:
+            email = (raw.get("email") or "").strip()
+            pickup_url = (raw.get("pickup_url") or raw.get("code_url") or raw.get("url") or "").strip()
+            if not email or not pickup_url or "/pickup" not in pickup_url or "#" not in pickup_url:
+                skipped += 1
+                continue
+            if _find_by_email(rows, email):
+                skipped += 1
+                continue
+            row = {
+                "id": _next_id(rows),
+                "email": email,
+                "pickup_url": pickup_url,
+                "status": "available",
+                "used_at": None,
+                "note": None,
+                "imported_at": _now(),
+            }
+            row["copy_line"] = _flysms_email_line(row)
+            rows.append(row)
+            inserted += 1
+        _save_flysms_emails(rows)
+        return inserted, skipped
+
+
+def migrate_flysms_from_generic_api_pool() -> int:
+    """把旧通用 API 池中明显的 FlySMS pickup 行一次性移到独立池。"""
+    with _LOCK:
+        generic_rows = _load_generic_api_emails()
+        flysms_rows = _load_flysms_emails()
+        accounts = _load_accounts()
+        kept = []
+        migrated = 0
+        removed = 0
+        for row in generic_rows:
+            code_url = str(row.get("code_url") or "")
+            is_flysms = "/pickup" in code_url and "#email=" in code_url and "&key=" in code_url
+            if not is_flysms:
+                kept.append(row)
+                continue
+            removed += 1
+            if not _find_by_email(flysms_rows, row.get("email") or ""):
+                moved = dict(row)
+                moved["id"] = _next_id(flysms_rows)
+                moved["pickup_url"] = code_url
+                moved.pop("code_url", None)
+                if not _find_by_email(accounts, moved.get("email") or "") and moved.get("status") in ("used", "failed"):
+                    moved["status"] = "available"
+                    moved["used_at"] = None
+                    moved["note"] = "从通用 API 池迁移到 FlySMS，已恢复可用"
+                moved["copy_line"] = _flysms_email_line(moved)
+                flysms_rows.append(moved)
+                migrated += 1
+        if removed:
+            _save_generic_api_emails(kept)
+            _save_flysms_emails(flysms_rows)
+        return migrated
+
+
+def claim_next_flysms_email() -> dict | None:
+    with _LOCK:
+        rows = sorted(_load_flysms_emails(), key=lambda x: int(x.get("id") or 0))
+        row = next((r for r in rows if r.get("status") == "available"), None)
+        if row is None:
+            return None
+        row["status"] = "used"
+        row["used_at"] = _now()
+        row["note"] = None
+        _save_flysms_emails(rows)
+        return _decorate_flysms_email(row)
+
+
+def release_flysms_email(email: str, status: str = "available", note: str | None = None) -> None:
+    with _LOCK:
+        rows = _load_flysms_emails()
+        row = _find_by_email(rows, email)
+        if row is None:
+            return
+        row["status"] = status
+        if status == "available":
+            row["used_at"] = None
+        elif status in ("used", "failed", "disabled"):
+            row["used_at"] = row.get("used_at") or _now()
+        if note is not None:
+            row["note"] = note
+        _save_flysms_emails(rows)
+
+
+def release_unconsumed_flysms_email(email: str, note: str | None = None) -> bool:
+    with _LOCK:
+        if _find_by_email(_load_accounts(), email) is not None:
+            return False
+        rows = _load_flysms_emails()
+        row = _find_by_email(rows, email)
+        if row is None or row.get("status") != "used":
+            return False
+        row["status"] = "available"
+        row["used_at"] = None
+        if note is not None:
+            row["note"] = note
+        _save_flysms_emails(rows)
+        return True
+
+
+def delete_flysms_email(email: str) -> bool:
+    with _LOCK:
+        rows = _load_flysms_emails()
+        target = (email or "").lower()
+        new_rows = [r for r in rows if (r.get("email") or "").lower() != target]
+        if len(new_rows) == len(rows):
+            return False
+        _save_flysms_emails(new_rows)
+        return True
+
+
+def list_flysms_email_pool(status: str | None = None, limit: int = 500) -> list[dict]:
+    with _LOCK:
+        account_by_email = {(a.get("email") or "").lower(): a for a in _load_accounts()}
+        rows = _load_flysms_emails()
+        if status:
+            rows = [r for r in rows if r.get("status") == status]
+        rows = sorted(rows, key=lambda x: int(x.get("id") or 0), reverse=True)
+        return [_decorate_flysms_email(r, account_by_email) for r in rows[:limit]]
+
+
+def flysms_email_pool_summary() -> dict:
+    with _LOCK:
+        out = {"available": 0, "used": 0, "failed": 0}
+        for row in _load_flysms_emails():
+            status = row.get("status") or "available"
+            out[status] = out.get(status, 0) + 1
+        out["total"] = sum(v for k, v in out.items() if k != "total")
+        return out
+
+
+def get_flysms_email_by_email(email: str) -> dict | None:
+    with _LOCK:
+        row = _find_by_email(_load_flysms_emails(), email)
+        return _decorate_flysms_email(row) if row else None
+
+
+def consume_flysms_message(email: str, mailbox_received_at: str | None, uid) -> bool:
+    """原子记录已返回的 FlySMS 邮件；同一封邮件只能被一个取码操作消费一次。"""
+    with _LOCK:
+        rows = _load_flysms_emails()
+        row = _find_by_email(rows, email)
+        if row is None:
+            return False
+        received_at = str(mailbox_received_at or "").strip()
+        uid_text = str(uid or "").strip()
+        last_received_at = str(row.get("last_consumed_mailbox_received_at") or "").strip()
+        last_uid = str(row.get("last_consumed_uid") or "").strip()
+        if not received_at:
+            return False
+        if uid_text and last_uid and uid_text == last_uid:
+            return False
+        if last_received_at:
+            try:
+                current_dt = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+                last_dt = datetime.fromisoformat(last_received_at.replace("Z", "+00:00"))
+            except ValueError:
+                return False
+            if current_dt < last_dt:
+                return False
+            if current_dt == last_dt:
+                try:
+                    if not uid_text or not last_uid or int(uid_text) <= int(last_uid):
+                        return False
+                except ValueError:
+                    return False
+        row["last_consumed_mailbox_received_at"] = received_at or None
+        row["last_consumed_uid"] = uid_text or None
+        row["last_consumed_at"] = _now()
+        _save_flysms_emails(rows)
+        return True
 
 
 # ============================================================

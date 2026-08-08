@@ -9,9 +9,22 @@ from core import email_provider
 class GPTMailProviderTests(unittest.TestCase):
     def test_parse_sources_keeps_gptmail_in_order(self):
         self.assertEqual(
-            email_provider.parse_email_sources("outlook,gptmail,generic_api,mailnest,cloudmail"),
-            ["outlook", "gptmail", "generic_api", "mailnest", "cloudmail"],
+            email_provider.parse_email_sources("outlook,gptmail,flysms,generic_api,mailnest,cloudmail"),
+            ["outlook", "gptmail", "flysms", "generic_api", "mailnest", "cloudmail"],
         )
+
+    @patch("core.flysms_mail_client.pick_account")
+    def test_acquire_email_uses_flysms_client(self, pick_account):
+        pick_account.return_value.email = "fresh@flysms.test"
+        with patch("core.email_provider.parse_email_sources", return_value=["flysms"]):
+            self.assertEqual(email_provider.acquire_email(), "fresh@flysms.test")
+
+    @patch("core.flysms_mail_client.fetch_latest_otp", return_value="778899")
+    @patch("core.email_provider.resolve_email_source", return_value="flysms")
+    def test_wait_for_otp_uses_flysms_client(self, resolve, fetch_latest_otp):
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True):
+            self.assertEqual(email_provider.wait_for_otp("fresh@flysms.test", after_ts=123.0), "778899")
+        fetch_latest_otp.assert_called_once_with("fresh@flysms.test", after_ts=123.0)
 
     @patch("core.gptmail_client.pick_account")
     def test_acquire_email_uses_gptmail_client(self, pick_account):
